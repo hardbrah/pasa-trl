@@ -22,6 +22,8 @@ from transformers import (
     HfArgumentParser,
     Trainer,
     AutoConfig,
+    Qwen2ForSequenceClassification,
+    Qwen2Model,
 )
 
 from trl import ModelConfig, PPOConfig, PPOTrainer, ScriptArguments
