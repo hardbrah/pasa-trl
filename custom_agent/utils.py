@@ -1,14 +1,23 @@
 import re
 import gc
 import json
+import tokenize
+from unittest import result
 import torch
 import warnings
 import threading
 import concurrent.futures
-from typing                     import List, Dict, Any
-from deepspeed.accelerator      import get_accelerator
+from typing import List, Dict, Any
+
+from torch.nn.modules import padding
+from transformers.models.auto.tokenization_auto import AutoTokenizer
+from transformers.utils.dummy_pt_objects import AutoModelForCausalLM
+from deepspeed.accelerator import get_accelerator
 from custom_agent.agent_dataset import prompts
-from custom_agent.search_tools  import google_search_arxiv_id
+from custom_agent.search_tools import google_search_arxiv_id
+from threading import Lock
+import numpy as np
+from peft import PeftModel
 
 # hyperparameters
 MAX_PAPERS = 5
@@ -20,10 +29,12 @@ search_template = r"Search\](.*?)\["
 expand_user_query_template = r"research on `(.*?)`\."
 expand_template = r"Expand\](.*?)\["
 
+
 def keep_letters(s):
     letters = [c for c in s if c.isalpha()]
-    result = ''.join(letters)
+    result = "".join(letters)
     return result.lower()
+
 
 def search_paper_by_title(title, paper_db):
     title_key = keep_letters(title)
@@ -32,6 +43,7 @@ def search_paper_by_title(title, paper_db):
             return json.loads(f.read().decode("utf-8"))
     else:
         return None
+
 
 def get_expand_papers(section, paper, paper_db):
     section = keep_letters(section)
@@ -42,23 +54,33 @@ def get_expand_papers(section, paper, paper_db):
                 p = search_paper_by_title(title, paper_db)
                 if p is not None:
                     res.append(p)
-    return res   
+    return res
+
 
 def gen_value_model_prompt(title, user_query, paper_db):
     paper = search_paper_by_title(title, paper_db)
     if paper is None:
         return None, None
-    
+
     value_model_prompt = [
-        {"role": "user", "content": prompts["select_section"].format(
-            user_query=user_query,
-            title=paper["title"],
-            abstract=paper["abstract"],
-            sections=json.dumps(list(paper["sections"].keys()))
-        ).strip()},
-        {"role": "assistant", "content": "["} # use the value of token-`[` to approximate the value of the paper
+        {
+            "role": "user",
+            "content": prompts["select_section"]
+            .format(
+                user_query=user_query,
+                title=paper["title"],
+                abstract=paper["abstract"],
+                sections=json.dumps(list(paper["sections"].keys())),
+            )
+            .strip(),
+        },
+        {
+            "role": "assistant",
+            "content": "[",
+        },  # use the value of token-`[` to approximate the value of the paper
     ]
     return value_model_prompt, paper
+
 
 def call_vm(value_model_prompts, tokenizer, device, value_model):
     if len(value_model_prompts) > 0:
@@ -69,7 +91,7 @@ def call_vm(value_model_prompts, tokenizer, device, value_model):
             truncation=True,
             max_length=992,
             add_generation_prompt=False,
-        ) # [..., 151644, 77091, 198, 58, 151645]
+        )  # [..., 151644, 77091, 198, 58, 151645]
         input_ids = torch.tensor(input_ids, device=device)
         attention_mask = input_ids != tokenizer.pad_token_id
         position_ids = attention_mask.cumsum(1) - attention_mask.long()
@@ -90,7 +112,7 @@ def call_vm(value_model_prompts, tokenizer, device, value_model):
             [[{"role": "user", "content": "hello"}]],
             tokenize=True,
             padding=True,
-            padding_side='left',
+            padding_side="left",
             add_generation_prompt=True,
         )
         input_ids = torch.tensor(input_ids, device=device)
@@ -113,27 +135,65 @@ def call_vm(value_model_prompts, tokenizer, device, value_model):
     get_accelerator().empty_cache()
     return score
 
+
+# base_model = AutoModelForCausalLM.from_pretrained(
+#     "/root/autodl-tmp/models/Qwen/Qwen2___5-7B-Instruct",
+#     trust_remote_code=True,
+#     device_map="auto",
+#     torch_dtype=torch.bfloat16,
+# ).to("cuda")
+# tokenizer = AutoTokenizer.from_pretrained(
+#     "/root/autodl-tmp/models/Qwen/Qwen2___5-7B-Instruct",
+#     padding_side="left",
+#     trust_remote_code=True,
+# )
+# select_model = PeftModel.from_pretrained(base_model, "/root/pasa/results/sft_selector/checkpoint-4957").to("cuda")
+
+
 def call_selector(select_prompts: List[str]) -> List[Dict[str, Any]]:
-    warnings.warn("Deploy an additional selector to get the relevant possibilities of paper and user_query.\nImplement a function `call_selector` that takes the prompts of the selector as input and returns the probability scores.")
+    # warnings.warn(
+    #     "Deploy an additional selector to get the relevant possibilities of paper and user_query.\nImplement a function `call_selector` that takes the prompts of the selector as input and returns the probability scores."
+    # )
+    # if len(select_prompts) == 0:
+    #     return [{"prob": 0} for _ in range(len(select_prompts))]
+    # encoded_input = tokenizer(
+    #     select_prompts, return_tensors="pt", padding=True, truncation=True
+    # )
+    # input_ids = encoded_input.input_ids.cuda(select_model.device)
+    # attention_mask = encoded_input.attention_mask.cuda(select_model.device)
+
+    # outputs = select_model.generate(
+    #     input_ids=input_ids,
+    #     attention_mask=attention_mask,
+    #     max_new_tokens=1,
+    #     output_scores=True,
+    #     return_dict_in_generate=True,
+    #     do_sample=False,
+    # )
+    # true_token_id = tokenizer.convert_tokens_to_ids("True")
+    # probs = outputs.scores[0].softmax(dim=-1)[:, true_token_id].cpu().numpy().tolist()
+    # return [{"prob": p} for p in probs]
+
     return [{"prob": 0} for _ in range(len(select_prompts))]
 
+
 def response_handler(
-        num, 
-        response, 
-        all_papers, 
-        all_scores, 
-        lock, 
-        query_responses, 
-        tokenizer, 
-        context_length, 
-        value_model, 
-        args, 
-        paper_db,
-        paper_id,
-        typ="search", 
-        f_paper=None,
-        answer=[]
-    ): 
+    num,
+    response,
+    all_papers,
+    all_scores,
+    lock,
+    query_responses,
+    tokenizer,
+    context_length,
+    value_model,
+    args,
+    paper_db,
+    paper_id,
+    typ="search",
+    f_paper=None,
+    answer=[],
+):
     # log("answer", answer)
     scores, has_stop = [], False
     if typ == "search":
@@ -152,19 +212,21 @@ def response_handler(
         max_action = 5
         if "[StopExpand]" in response:
             has_stop = True
-    
+
     # parse the model output
     user_query = re.findall(user_query_template, response, flags=re.DOTALL)
     if len(user_query) > 0:
         user_query = user_query[0].strip()
     else:
         user_query = ""
-    query_keys = [q.strip() for q in re.findall(query_keys_template, response, flags=re.DOTALL)]
+    query_keys = [
+        q.strip() for q in re.findall(query_keys_template, response, flags=re.DOTALL)
+    ]
     searched_paper_set = set()
 
     for idx in range(max(max_action, len(query_keys))):
         score = -cost
-        if idx < max_action: # must call value model `max_action` times
+        if idx < max_action:  # must call value model `max_action` times
             searched_papers, value_model_prompts, select_prompts = [], [], []
 
             # do search or expand
@@ -175,12 +237,16 @@ def response_handler(
                     if search_ids is not None:
                         for search_id in search_ids:
                             if search_id in paper_id:
-                                searched_paper = search_paper_by_title(paper_id[search_id], paper_db)
+                                searched_paper = search_paper_by_title(
+                                    paper_id[search_id], paper_db
+                                )
                                 if searched_paper:
                                     searched_papers.append(searched_paper)
                         searched_papers = searched_papers[:MAX_PAPERS]
                 else:
-                    searched_papers = get_expand_papers(query_keys[idx], f_paper, paper_db)
+                    searched_papers = get_expand_papers(
+                        query_keys[idx], f_paper, paper_db
+                    )
 
             if len(searched_papers) > 0:
                 results = []
@@ -193,7 +259,13 @@ def response_handler(
                 if args.use_selector:
                     # get selector score
                     for searched_paper in searched_papers:
-                        select_prompts.append(select_prompt.format(title=searched_paper["title"], abstract=searched_paper["abstract"], user_query=user_query))
+                        select_prompts.append(
+                            select_prompt.format(
+                                title=searched_paper["title"],
+                                abstract=searched_paper["abstract"],
+                                user_query=user_query,
+                            )
+                        )
                     selector_results = call_selector(select_prompts)
                     for i in range(len(results)):
                         if selector_results[i]["prob"] > results[i]["prob"]:
@@ -205,28 +277,36 @@ def response_handler(
                 for searched_paper, result in zip(searched_papers, results):
                     if keep_letters(searched_paper["title"]) not in searched_paper_set:
                         searched_paper_set.add(keep_letters(searched_paper["title"]))
-                    else: # repeated searches will not be counted
+                    else:  # repeated searches will not be counted
                         continue
                     if result["prob"] > 0.5:
                         score += select_score
-                    value_model_prompt, paper = gen_value_model_prompt(searched_paper["title"], user_query, paper_db)
+                    value_model_prompt, paper = gen_value_model_prompt(
+                        searched_paper["title"], user_query, paper_db
+                    )
                     if value_model_prompt is None:
                         continue
                     all_prompts.append([result["prob"], paper, value_model_prompt])
                 all_prompts.sort(key=lambda x: x[0], reverse=True)
-                all_prompts = all_prompts[:MAX_PAPERS + 2]
+                all_prompts = all_prompts[: MAX_PAPERS + 2]
                 all_prompts.sort(key=lambda x: len(x[2][0]["content"]))
                 for i in all_prompts[:MAX_PAPERS]:
                     value_model_prompts.append(i[2])
                     with lock:
                         all_papers.append([i[0], i[1], i[2][:1], answer])
-                
+
             # get value model score
             if args.use_vm:
                 with lock:
-                    with concurrent.futures.ThreadPoolExecutor() as executor: # Even if OOM while calling value model, it will not affect the training.
+                    with concurrent.futures.ThreadPoolExecutor() as executor:  # Even if OOM while calling value model, it will not affect the training.
                         try:
-                            future = executor.submit(call_vm, value_model_prompts, tokenizer, query_responses.device, value_model)
+                            future = executor.submit(
+                                call_vm,
+                                value_model_prompts,
+                                tokenizer,
+                                query_responses.device,
+                                value_model,
+                            )
                             result = future.result()
                             score += args.gamma1 * result
                         except Exception as e:
@@ -234,14 +314,14 @@ def response_handler(
 
         if idx < len(query_keys):
             scores.append(max(min(score, 5), -args.search_cost))
-    
+
     # score should be apply to each `[`(58) token
     score_tensor = torch.zeros(query_responses.shape[1] - context_length)
     score_idx = len(scores) - 1
     for i in range(-1, -score_tensor.shape[0] - 1, -1):
         if has_stop and query_responses[num][i] == 60:
             has_stop = False
-            score_tensor[i] = cost # reward for stop token
+            score_tensor[i] = cost  # reward for stop token
         if query_responses[num][i] == 58:
             if score_idx < 0:
                 break
@@ -252,45 +332,60 @@ def response_handler(
     with lock:
         all_scores[num] = score_tensor
 
-def rollout(query_responses, tokenizer, context_length, value_model, args, paper_db, paper_id, answers, papers, typ="search", return_new_query=True):
-    
+
+def rollout(
+    query_responses,
+    tokenizer,
+    context_length,
+    value_model,
+    args,
+    paper_db,
+    paper_id,
+    answers,
+    papers,
+    typ="search",
+    return_new_query=True,
+):
+
     # decode to strs
-    query_response_strs = tokenizer.batch_decode(query_responses, skip_special_tokens=True)
+    query_response_strs = tokenizer.batch_decode(
+        query_responses, skip_special_tokens=True
+    )
     # log("query_response_strs", query_response_strs)
     all_papers, all_scores = [], {}
     lock = threading.Lock()
 
-    # parse response, search paper and generate 
+    # parse response, search paper and generate
     threads = []
     for num, response in enumerate(query_response_strs):
         f_paper = None
-        if typ=="expand":
+        if typ == "expand":
             f_paper = papers[num]
         thread = threading.Thread(
-            target=response_handler, 
+            target=response_handler,
             args=(
-                num, 
-                response, 
-                all_papers, 
-                all_scores, 
-                lock, 
-                query_responses, 
-                tokenizer, 
-                context_length, 
-                value_model, 
-                args, 
+                num,
+                response,
+                all_papers,
+                all_scores,
+                lock,
+                query_responses,
+                tokenizer,
+                context_length,
+                value_model,
+                args,
                 paper_db,
                 paper_id,
-                typ, 
+                typ,
                 f_paper,
-                [keep_letters(answer) for answer in answers[num]]
-            )
+                [keep_letters(answer) for answer in answers[num]],
+            ),
         )
         threads.append(thread)
         thread.start()
     for thread in threads:
         thread.join()
-    
+
     torch.distributed.barrier()
     all_scores_list = []
     for i in range(query_responses.shape[0]):
@@ -298,7 +393,9 @@ def rollout(query_responses, tokenizer, context_length, value_model, args, paper
             all_scores_list.append(all_scores[i])
         else:
             print("Error, index not in value")
-            all_scores_list.append(torch.zeros(query_responses.shape[1] - context_length))
+            all_scores_list.append(
+                torch.zeros(query_responses.shape[1] - context_length)
+            )
     all_scores = torch.stack(all_scores_list).to(query_responses.device)
 
     if return_new_query:
@@ -311,7 +408,7 @@ def rollout(query_responses, tokenizer, context_length, value_model, args, paper
             all_papers += all_papers
         next_data = all_papers[:6]
         value_model_prompts = [i[2] for i in next_data]
-        
+
         # tokenize一下，处理一下0条的情况
         input_ids = None
         if len(next_data) > 0:
@@ -325,7 +422,11 @@ def rollout(query_responses, tokenizer, context_length, value_model, args, paper
             )
             input_ids = torch.tensor(input_ids, device=query_responses.device)
 
-        return input_ids, [i[1] for i in next_data], all_scores, [i[3] for i in next_data]
+        return (
+            input_ids,
+            [i[1] for i in next_data],
+            all_scores,
+            [i[3] for i in next_data],
+        )
     else:
         return None, None, all_scores, []
-    

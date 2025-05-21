@@ -20,7 +20,8 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     HfArgumentParser,
-    Trainer
+    Trainer,
+    AutoConfig,
 )
 
 from trl import ModelConfig, PPOConfig, PPOTrainer, ScriptArguments
@@ -29,9 +30,12 @@ from custom_agent.agent_dataset import AgentDataset
 from typing import Optional
 import torch.nn as nn
 
+
 class FixZero3CheckpointPPOTrainer(PPOTrainer):
 
-    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+    def save_model(
+        self, output_dir: Optional[str] = None, _internal_call: bool = False
+    ):
         backup_model = self.model
         self.model = self.model.policy  # save only the policy
 
@@ -41,10 +45,28 @@ class FixZero3CheckpointPPOTrainer(PPOTrainer):
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if self.is_deepspeed_enabled:
-            state_dict = {name.removeprefix('policy.'): param for name, param in state_dict.items()
-                          if name.startswith('policy.')}
+            state_dict = {
+                name.removeprefix("policy."): param
+                for name, param in state_dict.items()
+                if name.startswith("policy.")
+            }
 
         super()._save(output_dir, state_dict)
+
+
+class CustomQwen2ForSequenceClassification(Qwen2ForSequenceClassification):
+    def __init__(self, lora_path, config) -> None:
+        super().__init__(config)
+        self.num_labels = 1
+        model = Qwen2Model(config)
+        self.model = PeftModel.from_pretrained(model, lora_path, is_trainable=True)
+        self.score = nn.Sequential(
+            nn.Linear(config.hidden_size, 384, bias=False),
+            nn.Linear(384, num_labels, bias=False),
+        )
+
+        self.post_init()
+
 
 if __name__ == "__main__":
     parser = HfArgumentParser((ScriptArguments, PPOConfig, ModelConfig))
@@ -55,23 +77,41 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(
         model_config.model_name_or_path,
         padding_side="left",
-        trust_remote_code=model_config.trust_remote_code
+        trust_remote_code=model_config.trust_remote_code,
     )
     train_dataset = AgentDataset(script_args.dataset_name, tokenizer)
-    assert train_dataset[0]["input_ids"][-1] != tokenizer.eos_token_id, "The last token should not be an EOS token"
+    assert (
+        train_dataset[0]["input_ids"][-1] != tokenizer.eos_token_id
+    ), "The last token should not be an EOS token"
 
     # models
-    value_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path, trust_remote_code=model_config.trust_remote_code, num_labels=1
+    config = AutoConfig.from_pretrained(
+        training_args.reward_model_path,
+        num_labels=1,
+        trust_remote_code=model_args.trust_remote_code,
+    )
+    value_model = CustomQwen2ForSequenceClassification(
+        lora_path=training_args.lora_path, config=config
     )
     for m in value_model.score.modules():
         if isinstance(m, nn.Linear):
             nn.init.normal_(m.weight, mean=0, std=0.01)
-    ref_policy = AutoModelForCausalLM.from_pretrained(
-        training_args.sft_model_path, trust_remote_code=model_config.trust_remote_code
+    ref_policy = None
+    policy_base = AutoModelForCausalLM.from_pretrained(
+        training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code
     )
-    policy = AutoModelForCausalLM.from_pretrained(
-        training_args.sft_model_path, trust_remote_code=model_config.trust_remote_code
+    policy = PeftModel.from_pretrained(
+        policy_base,
+        adapter_name=training_args.model_adapter_name,
+        torch_dtype=torch.bfloat16,
+        model_id=training_args.lora_path,
+        lora_dropout=0.0,
+        is_trainable=True,
+    )
+    policy.load_adapter(
+        training_args.lora_path,
+        adapter_name=training_args.ref_adapter_name,
+        is_trainable=False,
     )
 
     trainer = FixZero3CheckpointPPOTrainer(

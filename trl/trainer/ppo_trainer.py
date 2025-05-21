@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager, nullcontext
 import gc
 import math
 import json
@@ -46,7 +47,13 @@ from transformers import (
 )
 from transformers.integrations import get_reporting_integration_callbacks
 from transformers.trainer import DEFAULT_CALLBACKS, DEFAULT_PROGRESS_CALLBACK
-from transformers.trainer_callback import CallbackHandler, ExportableState, PrinterCallback
+from transformers.trainer_callback import (
+    CallbackHandler,
+    ExportableState,
+    PrinterCallback,
+)
+from transformers.utils import is_peft_available
+from peft import PeftModel
 
 from ..core import masked_mean, masked_whiten
 from ..models.utils import unwrap_model_for_generation
@@ -72,6 +79,7 @@ if is_wandb_available():
 
 INVALID_LOGPROB = 1.0
 
+
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
 # we did this we can do a single `model = accelerator.prepare(model)`
 class PolicyAndValueWrapper(nn.Module):
@@ -96,7 +104,12 @@ class PPOTrainer(Trainer):
         self,
         config: PPOConfig,
         processing_class: Optional[
-            Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin]
+            Union[
+                PreTrainedTokenizerBase,
+                BaseImageProcessor,
+                FeatureExtractionMixin,
+                ProcessorMixin,
+            ]
         ],
         policy: nn.Module,
         ref_policy: nn.Module,
@@ -108,7 +121,10 @@ class PPOTrainer(Trainer):
         data_collator: Optional[AgentDataCollatorWithPadding] = None,
         eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
         # less commonly used
-        optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
+        optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (
+            None,
+            None,
+        ),
         callbacks: Optional[List[TrainerCallback]] = None,
     ) -> None:
         if ref_policy is policy:
@@ -133,29 +149,43 @@ class PPOTrainer(Trainer):
         self.data_collator = data_collator
         self.eval_dataset = eval_dataset
         self.optimizer, self.lr_scheduler = optimizers
-        self.paper_db = zipfile.ZipFile(paper_db, 'r')
-        self.paper_id = json.load(open(paper_id, 'r'))
-
+        self.paper_db = zipfile.ZipFile(paper_db, "r")
+        self.paper_id = json.load(open(paper_id, "r"))
+        self.model_adapter_name = config.model_adapter_name
+        self.ref_adapter_name = config.ref_adapter_name
+        self.is_peft_model = is_peft_available() and isinstance(
+            self.policy_model, PeftModel
+        )
         #########
         # calculate various batch sizes
         #########
-        if args.total_episodes is None:  # allow the users to define episodes in terms of epochs.
+        if (
+            args.total_episodes is None
+        ):  # allow the users to define episodes in terms of epochs.
             args.total_episodes = int(args.num_train_epochs * self.train_dataset_len)
 
-        accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
+        accelerator = Accelerator(
+            gradient_accumulation_steps=args.gradient_accumulation_steps
+        )
         self.accelerator = accelerator
-        
+
         args.world_size = accelerator.num_processes
         args.local_batch_size = (
-            args.per_device_train_batch_size * args.gradient_accumulation_steps * args.num_mini_batches
+            args.per_device_train_batch_size
+            * args.gradient_accumulation_steps
+            * args.num_mini_batches
         )
         args.micro_batch_size = int(args.per_device_train_batch_size * args.world_size)
         args.batch_size = int(args.local_batch_size * args.world_size)
         args.mini_batch_size = exact_div(
-            args.batch_size, args.num_mini_batches, "`batch_size` must be a multiple of `num_mini_batches`"
+            args.batch_size,
+            args.num_mini_batches,
+            "`batch_size` must be a multiple of `num_mini_batches`",
         )
         args.local_mini_batch_size = exact_div(
-            args.local_batch_size, args.num_mini_batches, "`local_batch_size` must be a multiple of `num_mini_batches`"
+            args.local_batch_size,
+            args.num_mini_batches,
+            "`local_batch_size` must be a multiple of `num_mini_batches`",
         )
         if args.whiten_rewards:
             assert (
@@ -167,19 +197,25 @@ class PPOTrainer(Trainer):
             args.total_episodes / args.batch_size
         )  # we may train for more than `total_episodes`
         time_tensor = torch.tensor(int(time.time()), device=accelerator.device)
-        time_int = broadcast(time_tensor, 0).item()  # avoid different timestamps across processes
+        time_int = broadcast(
+            time_tensor, 0
+        ).item()  # avoid different timestamps across processes
         args.run_name = f"{args.exp_name}__{args.seed}__{time_int}"
         self.local_seed = args.seed + accelerator.process_index * 100003  # Prime
         if args.num_sample_generations > 0:
-            self.sample_generations_freq = max(1, args.num_total_batches // args.num_sample_generations)
+            self.sample_generations_freq = max(
+                1, args.num_total_batches // args.num_sample_generations
+            )
         # self.local_dataloader_batch_size = args.local_batch_size
-        self.local_dataloader_batch_size = args.gradient_accumulation_steps # 1 user_query can generate 4 training data
+        self.local_dataloader_batch_size = (
+            args.gradient_accumulation_steps
+        )  # 1 user_query can generate 4 training data
 
         #########
         # setup model, optimizer, and others
         #########
         for module in [policy, ref_policy, value_model]:
-        # for module in [policy, value_model]:
+            # for module in [policy, value_model]:
             disable_dropout_in_model(module)
         if reward_model is not None:
             disable_dropout_in_model(reward_model)
@@ -194,24 +230,40 @@ class PPOTrainer(Trainer):
         #########
         ### trainer specifics
         #########
-        default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(self.args.report_to)
-        self.callbacks = default_callbacks if callbacks is None else default_callbacks + callbacks
-        self.callback_handler = CallbackHandler(
-            self.callbacks, self.model, self.processing_class, self.optimizer, self.lr_scheduler
+        default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(
+            self.args.report_to
         )
-        self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
+        self.callbacks = (
+            default_callbacks if callbacks is None else default_callbacks + callbacks
+        )
+        self.callback_handler = CallbackHandler(
+            self.callbacks,
+            self.model,
+            self.processing_class,
+            self.optimizer,
+            self.lr_scheduler,
+        )
+        self.add_callback(
+            PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK
+        )
         self.control = TrainerControl()
         self.state = OnlineTrainerState(
             is_local_process_zero=self.is_local_process_zero(),
             is_world_process_zero=self.is_world_process_zero(),
             stateful_callbacks=[
-                cb for cb in self.callback_handler.callbacks + [self.control] if isinstance(cb, ExportableState)
+                cb
+                for cb in self.callback_handler.callbacks + [self.control]
+                if isinstance(cb, ExportableState)
             ],
         )
         self.current_flos = 0
         self.hp_search_backend = None
-        self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
-        self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
+        self.is_deepspeed_enabled = (
+            getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
+        )
+        self.is_fsdp_enabled = (
+            getattr(self.accelerator.state, "fsdp_plugin", None) is not None
+        )
         # Create distant repo and output directory if needed
         self.hub_model_id = None
         if self.args.push_to_hub:
@@ -236,7 +288,9 @@ class PPOTrainer(Trainer):
         # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
         # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
         torch.manual_seed(args.seed)
-        self.model, self.optimizer, self.dataloader = accelerator.prepare(self.model, self.optimizer, self.dataloader)
+        self.model, self.optimizer, self.dataloader = accelerator.prepare(
+            self.model, self.optimizer, self.dataloader
+        )
         torch.manual_seed(self.local_seed)  # reset the local seed again
 
         if self.eval_dataset is not None:
@@ -251,7 +305,10 @@ class PPOTrainer(Trainer):
         if self.is_deepspeed_enabled:
             if reward_model is not None:
                 self.reward_model = prepare_deepspeed(
-                    self.reward_model, args.per_device_train_batch_size, args.fp16, args.bf16
+                    self.reward_model,
+                    args.per_device_train_batch_size,
+                    args.fp16,
+                    args.bf16,
                 )
             self.ref_policy = prepare_deepspeed(
                 self.ref_policy, args.per_device_train_batch_size, args.fp16, args.bf16
@@ -267,7 +324,23 @@ class PPOTrainer(Trainer):
     def get_eval_dataloader(self) -> DataLoader:
         return self.eval_dataloader
 
-    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+    @contextmanager
+    def null_ref_context(self):
+        """Context manager for handling null reference model (that is, peft adapter manipulation)."""
+        with (
+            self.accelerator.unwrap_model(self.model.policy).disable_adapter()
+            if self.is_peft_model and not self.ref_adapter_name
+            else nullcontext()
+        ):
+            if self.ref_adapter_name:
+                self.model.policy.set_adapter(self.ref_adapter_name)
+            yield
+            if self.ref_adapter_name:
+                self.model.policy.set_adapter(self.model_adapter_name)
+
+    def save_model(
+        self, output_dir: Optional[str] = None, _internal_call: bool = False
+    ):
         backup_model = self.model
         self.model = self.model.policy  # save only the policy
 
@@ -309,7 +382,11 @@ class PPOTrainer(Trainer):
         start_time = time.time()
 
         # 1st round 4 search queries, 2nd round and beyond 6 expand queries.
-        stats_shape = (args.num_ppo_epochs, args.num_mini_batches, (6 * args.rounds - 2) // args.per_device_train_batch_size)
+        stats_shape = (
+            args.num_ppo_epochs,
+            args.num_mini_batches,
+            (6 * args.rounds - 2) // args.per_device_train_batch_size,
+        )
         approxkl_stats = torch.zeros(stats_shape, device=device)
         pg_clipfrac_stats = torch.zeros(stats_shape, device=device)
         pg_loss_stats = torch.zeros(stats_shape, device=device)
@@ -327,27 +404,37 @@ class PPOTrainer(Trainer):
         # Compute absolute values for logging, eval, and save if given as ratio
         if args.logging_steps is not None:
             if args.logging_steps < 1:
-                self.state.logging_steps = math.ceil(self.state.max_steps * args.logging_steps)
+                self.state.logging_steps = math.ceil(
+                    self.state.max_steps * args.logging_steps
+                )
             else:
                 self.state.logging_steps = args.logging_steps
         if args.eval_steps is not None:
             if args.eval_steps < 1:
-                self.state.eval_steps = math.ceil(self.state.max_steps * args.eval_steps)
+                self.state.eval_steps = math.ceil(
+                    self.state.max_steps * args.eval_steps
+                )
             else:
                 self.state.eval_steps = args.eval_steps
         if args.save_steps is not None:
             if args.save_steps < 1:
-                self.state.save_steps = math.ceil(self.state.max_steps * args.save_steps)
+                self.state.save_steps = math.ceil(
+                    self.state.max_steps * args.save_steps
+                )
             else:
                 self.state.save_steps = args.save_steps
-        self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
+        self.control = self.callback_handler.on_train_begin(
+            args, self.state, self.control
+        )
 
         # backward compatibility
         if self.is_deepspeed_enabled:
             self.deepspeed = self.model
             self.model_wrapped = self.model
 
-        torch.set_printoptions(threshold=float('inf')) # print all items of a tensor for debug !!!
+        torch.set_printoptions(
+            threshold=float("inf")
+        )  # print all items of a tensor for debug !!!
         for update in range(1, args.num_total_batches + 1):
             self.state.episode += 1 * args.gradient_accumulation_steps * args.world_size
             data = next(iter_dataloader)
@@ -359,63 +446,67 @@ class PPOTrainer(Trainer):
                 scores = []
                 sequence_lengths = []
                 values = []
-                
+
                 unwrapped_value_model = self.accelerator.unwrap_model(model).value_model
                 query_responses, logitss, response_lengths = [], [], []
 
                 answers = data["answers"]
-                answers = self.processing_class.batch_decode(answers, skip_special_tokens=True)
+                answers = self.processing_class.batch_decode(
+                    answers, skip_special_tokens=True
+                )
                 answers = [json.loads(x) for x in answers]
                 queries = data["input_ids"]
                 queries_list = [queries]
                 context_length = queries.shape[1]
                 context_lengths = [context_length]
-                trajectory = ["search", True] # [type, retuen_new_query]
+                trajectory = ["search", True]  # [type, retuen_new_query]
                 f_papers, RANGE = None, args.rounds
 
-                with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+                with unwrap_model_for_generation(
+                    model, self.accelerator
+                ) as unwrapped_model:
                     for i in range(RANGE):
                         if i == RANGE - 1:
                             trajectory[1] = False
-                        
+
                         # generate responses using the policy model
                         self.accelerator.print("Trajectory:", trajectory)
                         query_response, logits = batch_generation(
                             unwrapped_model.policy,
                             queries,
-                            queries.shape[0], # 4 or 6
+                            queries.shape[0],  # 4 or 6
                             processing_class.pad_token_id,
                             generation_config,
-                        ) # [b, query_response_len], [b, response_len, vocab_size]
+                        )  # [b, query_response_len], [b, response_len, vocab_size]
 
                         query_responses.append(query_response)
                         logitss.append(logits)
                         response_lengths.append(logits.shape[1])
 
                         queries, next_f_papers, score, next_answers = rollout(
-                            query_response, 
-                            self.processing_class, 
-                            context_length, 
-                            unwrapped_value_model, 
-                            args, 
-                            self.paper_db, 
+                            query_response,
+                            self.processing_class,
+                            context_length,
+                            unwrapped_value_model,
+                            args,
+                            self.paper_db,
                             self.paper_id,
-                            answers, 
-                            f_papers, 
-                            trajectory[0], 
-                            trajectory[1]
+                            answers,
+                            f_papers,
+                            trajectory[0],
+                            trajectory[1],
                         )
                         scores.append(score)
-                        
+
                         if queries is None:
                             queries = queries_list[-1]
-                            if queries.shape[0] == 4: # hard-code exception handling
+                            if queries.shape[0] == 4:  # hard-code exception handling
                                 queries = torch.cat((queries, queries[:2, ...]), dim=0)
                         else:
                             trajectory[0] = "expand"
                             f_papers = next_f_papers
                             answers = next_answers
-                        
+
                         if trajectory[1]:
                             queries_list.append(queries)
                             context_length = queries.shape[1]
@@ -423,19 +514,50 @@ class PPOTrainer(Trainer):
                         torch.distributed.barrier()
 
                 # pad each batch to the same length
-                context_length, max_response_len = max(context_lengths), max(response_lengths)
+                context_length, max_response_len = max(context_lengths), max(
+                    response_lengths
+                )
                 for i in range(len(context_lengths)):
                     if context_lengths[i] < context_length:
-                        pad_left = torch.full((query_responses[i].shape[0], context_length - context_lengths[i]), processing_class.pad_token_id).to(device)
-                        query_responses[i] = torch.cat((pad_left, query_responses[i]), 1)
+                        pad_left = torch.full(
+                            (
+                                query_responses[i].shape[0],
+                                context_length - context_lengths[i],
+                            ),
+                            processing_class.pad_token_id,
+                        ).to(device)
+                        query_responses[i] = torch.cat(
+                            (pad_left, query_responses[i]), 1
+                        )
                         queries_list[i] = torch.cat((pad_left, queries_list[i]), 1)
                         del pad_left
                     if response_lengths[i] < max_response_len:
-                        pad_right = torch.full((query_responses[i].shape[0], max_response_len - response_lengths[i]), processing_class.pad_token_id).to(device)
-                        query_responses[i] = torch.cat((query_responses[i], pad_right), 1)
-                        pad_right = torch.full((query_responses[i].shape[0], max_response_len - response_lengths[i]), 0).to(device)
+                        pad_right = torch.full(
+                            (
+                                query_responses[i].shape[0],
+                                max_response_len - response_lengths[i],
+                            ),
+                            processing_class.pad_token_id,
+                        ).to(device)
+                        query_responses[i] = torch.cat(
+                            (query_responses[i], pad_right), 1
+                        )
+                        pad_right = torch.full(
+                            (
+                                query_responses[i].shape[0],
+                                max_response_len - response_lengths[i],
+                            ),
+                            0,
+                        ).to(device)
                         scores[i] = torch.cat((scores[i], pad_right), 1)
-                        pad_right = torch.full((query_responses[i].shape[0], max_response_len - response_lengths[i], logitss[i].shape[2]), 0).to(device)
+                        pad_right = torch.full(
+                            (
+                                query_responses[i].shape[0],
+                                max_response_len - response_lengths[i],
+                                logitss[i].shape[2],
+                            ),
+                            0,
+                        ).to(device)
                         logitss[i] = torch.cat((logitss[i], pad_right), 1)
                         del pad_right
                     torch.cuda.empty_cache()
@@ -444,22 +566,43 @@ class PPOTrainer(Trainer):
                 logitss = torch.cat(logitss, 0)
 
                 # calculate logits
-                for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
-                    query = queries[i: i + args.local_rollout_forward_batch_size]
-                    query_response = query_responses[i: i + args.local_rollout_forward_batch_size]
+                for i in range(
+                    0, queries.shape[0], args.local_rollout_forward_batch_size
+                ):
+                    query = queries[i : i + args.local_rollout_forward_batch_size]
+                    query_response = query_responses[
+                        i : i + args.local_rollout_forward_batch_size
+                    ]
                     response = query_response[:, context_length:]
-                    logits = logitss[i: i + args.local_rollout_forward_batch_size]
+                    logits = logitss[i : i + args.local_rollout_forward_batch_size]
                     all_logprob = F.log_softmax(logits, dim=-1)
-                    logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1) # logprob corresponding to the token in the response [per_device_train_batch_size, response_len]
+                    logprob = torch.gather(
+                        all_logprob, 2, response.unsqueeze(-1)
+                    ).squeeze(
+                        -1
+                    )  # logprob corresponding to the token in the response [per_device_train_batch_size, response_len]
                     del logits, all_logprob
                     torch.cuda.empty_cache()
 
-                    ref_policy = ref_policy.to(self.accelerator.device)
-                    ref_output = forward(ref_policy, query_response, processing_class.pad_token_id)
+                    if ref_policy is None:
+                        with self.null_ref_context():
+                            ref_output = forward(
+                                model.policy,
+                                query_response,
+                                processing_class.pad_token_id,
+                            )
+                    else:
+                        ref_output = forward(
+                            ref_policy, query_response, processing_class.pad_token_id
+                        )
                     ref_logits = ref_output.logits[:, context_length - 1 : -1]
                     ref_logits /= args.temperature + 1e-7
                     ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
-                    ref_logprob = torch.gather(ref_all_logprob, 2, response.unsqueeze(-1)).squeeze(-1) # [batch_size, response_len]
+                    ref_logprob = torch.gather(
+                        ref_all_logprob, 2, response.unsqueeze(-1)
+                    ).squeeze(
+                        -1
+                    )  # [batch_size, response_len]
                     ref_policy = ref_policy.cpu()
                     del ref_output, ref_logits, ref_all_logprob
                     torch.cuda.empty_cache()
@@ -472,13 +615,23 @@ class PPOTrainer(Trainer):
                         )
 
                     # Response Processing 2. run reward model on the truncated responses
-                    sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
-                    unwrapped_value_model = accelerator.unwrap_model(model).value_model
-                    
-                    full_value, _, _ = get_reward(
-                        unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
+                    sequence_length = (
+                        first_true_indices(
+                            postprocessed_response == processing_class.pad_token_id
+                        )
+                        - 1
                     )
-                    value = full_value[:, context_length - 1 : -1].squeeze(-1) # [batch_size, response_len] \in R
+                    unwrapped_value_model = accelerator.unwrap_model(model).value_model
+
+                    full_value, _, _ = get_reward(
+                        unwrapped_value_model,
+                        query_response,
+                        processing_class.pad_token_id,
+                        context_length,
+                    )
+                    value = full_value[:, context_length - 1 : -1].squeeze(
+                        -1
+                    )  # [batch_size, response_len] \in R
 
                     responses.append(response)
                     postprocessed_responses.append(postprocessed_response)
@@ -486,15 +639,21 @@ class PPOTrainer(Trainer):
                     ref_logprobs.append(ref_logprob)
                     sequence_lengths.append(sequence_length)
                     values.append(value)
-                
-                responses = torch.cat(responses, 0) # [local_batch_size, response_len]
-                postprocessed_responses = torch.cat(postprocessed_responses, 0) # [local_batch_size, response_len]
-                logprobs = torch.cat(logprobs, 0) # [local_batch_size, response_len]
-                ref_logprobs = torch.cat(ref_logprobs, 0) # [local_batch_size, response_len]
-                sequence_lengths = torch.cat(sequence_lengths, 0) # [local_batch_size] (response_len without eos)
-                
-                scores = torch.cat(scores, 0) # [local_batch_size, response_len]
-                values = torch.cat(values, 0) # [local_batch_size, response_len]
+
+                responses = torch.cat(responses, 0)  # [local_batch_size, response_len]
+                postprocessed_responses = torch.cat(
+                    postprocessed_responses, 0
+                )  # [local_batch_size, response_len]
+                logprobs = torch.cat(logprobs, 0)  # [local_batch_size, response_len]
+                ref_logprobs = torch.cat(
+                    ref_logprobs, 0
+                )  # [local_batch_size, response_len]
+                sequence_lengths = torch.cat(
+                    sequence_lengths, 0
+                )  # [local_batch_size] (response_len without eos)
+
+                scores = torch.cat(scores, 0)  # [local_batch_size, response_len]
+                values = torch.cat(values, 0)  # [local_batch_size, response_len]
                 del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
                 torch.cuda.empty_cache()
                 gc.collect()
@@ -506,23 +665,39 @@ class PPOTrainer(Trainer):
                 #     scores[~contain_eos_token] -= self.args.missing_eos_penalty
 
                 # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
-                response_idxs = torch.arange(responses.shape[1], device=responses.device).repeat(responses.shape[0], 1)
-                padding_mask = response_idxs > sequence_lengths.unsqueeze(1) # include eos
-                logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB) # include eos
-                ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB) # include eos
-                sequence_lengths_p1 = sequence_lengths + 1 # include eos and the first pad
-                padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1)) # include eos and the first pad
-                values = torch.masked_fill(values, padding_mask_p1, 0) # include eos and the first pad
+                response_idxs = torch.arange(
+                    responses.shape[1], device=responses.device
+                ).repeat(responses.shape[0], 1)
+                padding_mask = response_idxs > sequence_lengths.unsqueeze(
+                    1
+                )  # include eos
+                logprobs = torch.masked_fill(
+                    logprobs, padding_mask, INVALID_LOGPROB
+                )  # include eos
+                ref_logprobs = torch.masked_fill(
+                    ref_logprobs, padding_mask, INVALID_LOGPROB
+                )  # include eos
+                sequence_lengths_p1 = (
+                    sequence_lengths + 1
+                )  # include eos and the first pad
+                padding_mask_p1 = response_idxs > (
+                    sequence_lengths_p1.unsqueeze(1)
+                )  # include eos and the first pad
+                values = torch.masked_fill(
+                    values, padding_mask_p1, 0
+                )  # include eos and the first pad
 
                 # 4. compute rewards
                 kl = logprobs - ref_logprobs
-                non_score_reward = -args.kl_coef * kl # 0.1
+                non_score_reward = -args.kl_coef * kl  # 0.1
                 rewards = non_score_reward.clone()
                 rewards += scores
 
                 # 5. whiten rewards
                 if args.whiten_rewards:
-                    rewards = masked_whiten(rewards, mask=~padding_mask_p1, shift_mean=False)
+                    rewards = masked_whiten(
+                        rewards, mask=~padding_mask_p1, shift_mean=False
+                    )
                     rewards = torch.masked_fill(rewards, padding_mask_p1, 0)
 
                 # 6. compute advantages and returns
@@ -549,14 +724,22 @@ class PPOTrainer(Trainer):
             for ppo_epoch_idx in range(args.num_ppo_epochs):
                 b_inds = np.random.permutation(args.local_batch_size)
                 minibatch_idx = 0
-                for mini_batch_start in range(0, args.local_batch_size, args.local_mini_batch_size):
+                for mini_batch_start in range(
+                    0, args.local_batch_size, args.local_mini_batch_size
+                ):
                     mini_batch_end = mini_batch_start + args.local_mini_batch_size
                     mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
                     gradient_accumulation_idx = 0
-                    for micro_batch_start in range(0, args.local_mini_batch_size, args.per_device_train_batch_size):
+                    for micro_batch_start in range(
+                        0, args.local_mini_batch_size, args.per_device_train_batch_size
+                    ):
                         with accelerator.accumulate(model):
-                            micro_batch_end = micro_batch_start + args.per_device_train_batch_size
-                            micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
+                            micro_batch_end = (
+                                micro_batch_start + args.per_device_train_batch_size
+                            )
+                            micro_batch_inds = mini_batch_inds[
+                                micro_batch_start:micro_batch_end
+                            ]
                             mb_advantage = advantages[micro_batch_inds]
                             mb_responses = responses[micro_batch_inds]
                             mb_query_responses = query_responses[micro_batch_inds]
@@ -565,16 +748,24 @@ class PPOTrainer(Trainer):
                             mb_values = values[micro_batch_inds]
 
                             # print(mb_query_responses.shape)
-                            output, vpred_temp = forward(model, mb_query_responses, processing_class.pad_token_id)
+                            output, vpred_temp = forward(
+                                model, mb_query_responses, processing_class.pad_token_id
+                            )
                             logits = output.logits[:, context_length - 1 : -1]
                             logits /= args.temperature + 1e-7
                             new_all_logprobs = F.log_softmax(logits, dim=-1)
-                            new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
+                            new_logprobs = torch.gather(
+                                new_all_logprobs, 2, mb_responses.unsqueeze(-1)
+                            ).squeeze(-1)
                             new_logprobs = torch.masked_fill(
-                                new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
+                                new_logprobs,
+                                padding_mask[micro_batch_inds],
+                                INVALID_LOGPROB,
                             )
                             vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
-                            vpred = torch.masked_fill(vpred, padding_mask_p1[micro_batch_inds], 0)
+                            vpred = torch.masked_fill(
+                                vpred, padding_mask_p1[micro_batch_inds], 0
+                            )
                             vpredclipped = torch.clamp(
                                 vpred,
                                 mb_values - args.cliprange_value,
@@ -583,16 +774,23 @@ class PPOTrainer(Trainer):
                             vf_losses1 = torch.square(vpred - mb_return)
                             vf_losses2 = torch.square(vpredclipped - mb_return)
                             vf_loss_max = torch.max(vf_losses1, vf_losses2)
-                            vf_loss = 0.5 * masked_mean(vf_loss_max, ~padding_mask_p1[micro_batch_inds])
+                            vf_loss = 0.5 * masked_mean(
+                                vf_loss_max, ~padding_mask_p1[micro_batch_inds]
+                            )
                             vf_clipfrac = masked_mean(
-                                (vf_losses2 > vf_losses1).float(), ~padding_mask_p1[micro_batch_inds]
+                                (vf_losses2 > vf_losses1).float(),
+                                ~padding_mask_p1[micro_batch_inds],
                             )
                             logprobs_diff = new_logprobs - mb_logprobs
                             ratio = torch.exp(logprobs_diff)
                             pg_losses = -mb_advantage * ratio
-                            pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
+                            pg_losses2 = -mb_advantage * torch.clamp(
+                                ratio, 1.0 - args.cliprange, 1.0 + args.cliprange
+                            )
                             pg_loss_max = torch.max(pg_losses, pg_losses2)
-                            pg_loss = masked_mean(pg_loss_max, ~padding_mask[micro_batch_inds])
+                            pg_loss = masked_mean(
+                                pg_loss_max, ~padding_mask[micro_batch_inds]
+                            )
                             pg_coef = 0 if update < args.warm_up_step else 1
                             loss = pg_coef * pg_loss + args.vf_coef * vf_loss
                             accelerator.backward(loss)
@@ -600,29 +798,80 @@ class PPOTrainer(Trainer):
                             optimizer.zero_grad()
                             with torch.no_grad():
                                 pg_clipfrac = masked_mean(
-                                    (pg_losses2 > pg_losses).float(), ~padding_mask[micro_batch_inds]
+                                    (pg_losses2 > pg_losses).float(),
+                                    ~padding_mask[micro_batch_inds],
                                 )
                                 prob_dist = torch.nn.functional.softmax(logits, dim=-1)
-                                entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
+                                entropy = torch.logsumexp(logits, dim=-1) - torch.sum(
+                                    prob_dist * logits, dim=-1
+                                )
                                 approxkl = 0.5 * (logprobs_diff**2).mean()
-                                approxkl_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = approxkl
-                                pg_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = (
-                                    pg_clipfrac
-                                )
-                                pg_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_loss
-                                vf_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_loss
-                                vf_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = (
-                                    vf_clipfrac
-                                )
-                                entropy_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
-                                ratio_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = ratio.mean()
+                                approxkl_stats[
+                                    ppo_epoch_idx,
+                                    minibatch_idx,
+                                    gradient_accumulation_idx,
+                                ] = approxkl
+                                pg_clipfrac_stats[
+                                    ppo_epoch_idx,
+                                    minibatch_idx,
+                                    gradient_accumulation_idx,
+                                ] = pg_clipfrac
+                                pg_loss_stats[
+                                    ppo_epoch_idx,
+                                    minibatch_idx,
+                                    gradient_accumulation_idx,
+                                ] = pg_loss
+                                vf_loss_stats[
+                                    ppo_epoch_idx,
+                                    minibatch_idx,
+                                    gradient_accumulation_idx,
+                                ] = vf_loss
+                                vf_clipfrac_stats[
+                                    ppo_epoch_idx,
+                                    minibatch_idx,
+                                    gradient_accumulation_idx,
+                                ] = vf_clipfrac
+                                entropy_stats[
+                                    ppo_epoch_idx,
+                                    minibatch_idx,
+                                    gradient_accumulation_idx,
+                                ] = entropy.mean()
+                                ratio_stats[
+                                    ppo_epoch_idx,
+                                    minibatch_idx,
+                                    gradient_accumulation_idx,
+                                ] = ratio.mean()
                         gradient_accumulation_idx += 1
                     minibatch_idx += 1
                     del (
-                        output, vpred_temp, logits, new_all_logprobs, new_logprobs, vpred, vpredclipped,
-                        vf_losses1, vf_losses2, vf_loss, vf_clipfrac, logprobs_diff, ratio, pg_losses, pg_losses2, pg_loss_max,
-                        pg_loss, loss, pg_clipfrac, prob_dist, entropy, approxkl, mb_return,
-                        mb_advantage, mb_values, mb_responses, mb_query_responses, mb_logprobs,
+                        output,
+                        vpred_temp,
+                        logits,
+                        new_all_logprobs,
+                        new_logprobs,
+                        vpred,
+                        vpredclipped,
+                        vf_losses1,
+                        vf_losses2,
+                        vf_loss,
+                        vf_clipfrac,
+                        logprobs_diff,
+                        ratio,
+                        pg_losses,
+                        pg_losses2,
+                        pg_loss_max,
+                        pg_loss,
+                        loss,
+                        pg_clipfrac,
+                        prob_dist,
+                        entropy,
+                        approxkl,
+                        mb_return,
+                        mb_advantage,
+                        mb_values,
+                        mb_responses,
+                        mb_query_responses,
+                        mb_logprobs,
                     )
                     torch.cuda.empty_cache()
             with torch.no_grad():
@@ -635,34 +884,79 @@ class PPOTrainer(Trainer):
                 metrics = {}
                 metrics["eps"] = eps
                 metrics["objective/kl"] = self.accelerator.gather(mean_kl).mean().item()
-                metrics["objective/entropy"] = self.accelerator.gather(mean_entropy).mean().item()
-                metrics["objective/non_score_reward"] = self.accelerator.gather(mean_non_score_reward).mean().item()
-                metrics["objective/rlhf_reward"] = self.accelerator.gather(rlhf_reward).mean().item()
-                metrics["objective/scores"] = self.accelerator.gather(scores.sum(1).mean()).mean().item()
-                metrics["policy/approxkl_avg"] = self.accelerator.gather(approxkl_stats).mean().item()
-                metrics["policy/clipfrac_avg"] = self.accelerator.gather(pg_clipfrac_stats).mean().item()
-                metrics["loss/policy_avg"] = self.accelerator.gather(pg_loss_stats).mean().item()
-                metrics["loss/value_avg"] = self.accelerator.gather(vf_loss_stats).mean().item()
-                metrics["val/clipfrac_avg"] = self.accelerator.gather(vf_clipfrac_stats).mean().item()
-                metrics["policy/entropy_avg"] = self.accelerator.gather(entropy_stats).mean().item()
-                metrics["val/ratio"] = self.accelerator.gather(ratio_stats).mean().item()
-                metrics["val/ratio_var"] = self.accelerator.gather(ratio_stats).var().item()
-                metrics["val/num_eos_tokens"] = (responses == processing_class.eos_token_id).sum().item()
+                metrics["objective/entropy"] = (
+                    self.accelerator.gather(mean_entropy).mean().item()
+                )
+                metrics["objective/non_score_reward"] = (
+                    self.accelerator.gather(mean_non_score_reward).mean().item()
+                )
+                metrics["objective/rlhf_reward"] = (
+                    self.accelerator.gather(rlhf_reward).mean().item()
+                )
+                metrics["objective/scores"] = (
+                    self.accelerator.gather(scores.sum(1).mean()).mean().item()
+                )
+                metrics["policy/approxkl_avg"] = (
+                    self.accelerator.gather(approxkl_stats).mean().item()
+                )
+                metrics["policy/clipfrac_avg"] = (
+                    self.accelerator.gather(pg_clipfrac_stats).mean().item()
+                )
+                metrics["loss/policy_avg"] = (
+                    self.accelerator.gather(pg_loss_stats).mean().item()
+                )
+                metrics["loss/value_avg"] = (
+                    self.accelerator.gather(vf_loss_stats).mean().item()
+                )
+                metrics["val/clipfrac_avg"] = (
+                    self.accelerator.gather(vf_clipfrac_stats).mean().item()
+                )
+                metrics["policy/entropy_avg"] = (
+                    self.accelerator.gather(entropy_stats).mean().item()
+                )
+                metrics["val/ratio"] = (
+                    self.accelerator.gather(ratio_stats).mean().item()
+                )
+                metrics["val/ratio_var"] = (
+                    self.accelerator.gather(ratio_stats).var().item()
+                )
+                metrics["val/num_eos_tokens"] = (
+                    (responses == processing_class.eos_token_id).sum().item()
+                )
                 metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
                 metrics["episode"] = self.state.episode
-                self.state.epoch = self.state.episode / self.train_dataset_len # used by self.log
+                self.state.epoch = (
+                    self.state.episode / self.train_dataset_len
+                )  # used by self.log
                 self.state.global_step += 1
                 self.log(metrics)
 
             self.lr_scheduler.step()
-            self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+            self.control = self.callback_handler.on_step_end(
+                args, self.state, self.control
+            )
             if self.control.should_save:
                 self._save_checkpoint(model, trial=None, metrics=metrics)
-                self.control = self.callback_handler.on_save(self.args, self.state, self.control)
-            del kl, mean_kl, mean_entropy, mean_non_score_reward, scores, metrics, non_score_reward, rlhf_reward, eps
+                self.control = self.callback_handler.on_save(
+                    self.args, self.state, self.control
+                )
+            del (
+                kl,
+                mean_kl,
+                mean_entropy,
+                mean_non_score_reward,
+                scores,
+                metrics,
+                non_score_reward,
+                rlhf_reward,
+                eps,
+            )
             torch.cuda.empty_cache()
 
-            if args.num_sample_generations > 0 and (update - 1) % self.sample_generations_freq == 0:
+            if (
+                args.num_sample_generations > 0
+                and (update - 1) % self.sample_generations_freq == 0
+            ):
                 self.generate_completions(sampling=True)
                 torch.cuda.empty_cache()
             del (
@@ -688,10 +982,14 @@ class PPOTrainer(Trainer):
             get_accelerator().empty_cache()
 
         # HF trainer specifics
-        self.control = self.callback_handler.on_train_end(args, self.state, self.control)
+        self.control = self.callback_handler.on_train_end(
+            args, self.state, self.control
+        )
         if self.control.should_save:
             self._save_checkpoint(model, trial=None, metrics=None)
-            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+            self.control = self.callback_handler.on_save(
+                self.args, self.state, self.control
+            )
 
     def generate_completions(self, sampling: bool = False):
         args = self.args
@@ -705,7 +1003,9 @@ class PPOTrainer(Trainer):
         )
 
         table = defaultdict(list)
-        with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
+        with unwrap_model_for_generation(
+            self.model, self.accelerator
+        ) as unwrapped_model:
             for batch in self.eval_dataloader:
                 query = batch["input_ids"]
                 with torch.no_grad():
@@ -719,25 +1019,44 @@ class PPOTrainer(Trainer):
                     )
                     response = query_response[:, context_length:]
                     postprocessed_response = response
-                    if args.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
+                    if (
+                        args.stop_token_id is not None
+                    ):  # handle the edge case when stop_token_id exists but is 0
                         postprocessed_response = truncate_response(
                             args.stop_token_id, processing_class.pad_token_id, response
                         )
                     table["query"].extend(
-                        gather_object(processing_class.batch_decode(query, skip_special_tokens=True))
+                        gather_object(
+                            processing_class.batch_decode(
+                                query, skip_special_tokens=True
+                            )
+                        )
                     )
                     table["model response"].extend(
-                        gather_object(processing_class.batch_decode(postprocessed_response))
+                        gather_object(
+                            processing_class.batch_decode(postprocessed_response)
+                        )
                     )
 
-                    postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
+                    postprocessed_query_response = torch.cat(
+                        (query, postprocessed_response), 1
+                    )
                     if isinstance(self.reward_model, nn.Module):
                         _, score, _ = get_reward(
-                            self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                            self.reward_model,
+                            postprocessed_query_response,
+                            processing_class.pad_token_id,
+                            context_length,
                         )
                     else:
-                        score = self.reward_model(postprocessed_query_response, processing_class.pad_token_id, context_length)
-                    table["score"].extend(self.accelerator.gather(score).float().cpu().numpy())
+                        score = self.reward_model(
+                            postprocessed_query_response,
+                            processing_class.pad_token_id,
+                            context_length,
+                        )
+                    table["score"].extend(
+                        self.accelerator.gather(score).float().cpu().numpy()
+                    )
 
                 if sampling:
                     break
@@ -771,7 +1090,9 @@ class PPOTrainer(Trainer):
         if not self.is_world_process_zero():
             return
 
-        if hasattr(self.model.config, "_name_or_path") and not os.path.isdir(self.model.config._name_or_path):
+        if hasattr(self.model.config, "_name_or_path") and not os.path.isdir(
+            self.model.config._name_or_path
+        ):
             base_model = self.model.config._name_or_path
         else:
             base_model = None
@@ -783,13 +1104,15 @@ class PPOTrainer(Trainer):
         if hasattr(self.model.config, "unsloth_version"):
             tags.append("unsloth")
 
-        citation = textwrap.dedent("""\
+        citation = textwrap.dedent(
+            """\
         @article{mziegler2019fine-tuning,
             title        = {{Fine-Tuning Language Models from Human Preferences}},
             author       = {Daniel M. Ziegler and Nisan Stiennon and Jeffrey Wu and Tom B. Brown and Alec Radford and Dario Amodei and Paul F. Christiano and Geoffrey Irving},
             year         = 2019,
             eprint       = {arXiv:1909.08593}
-        }""")
+        }"""
+        )
 
         model_card = generate_model_card(
             base_model=base_model,
@@ -797,7 +1120,11 @@ class PPOTrainer(Trainer):
             hub_model_id=self.hub_model_id,
             dataset_name=dataset_name,
             tags=tags,
-            wandb_url=wandb.run.get_url() if is_wandb_available() and wandb.run is not None else None,
+            wandb_url=(
+                wandb.run.get_url()
+                if is_wandb_available() and wandb.run is not None
+                else None
+            ),
             trainer_name="PPO",
             trainer_citation=citation,
             paper_title="Fine-Tuning Language Models from Human Preferences",
