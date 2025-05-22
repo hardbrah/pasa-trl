@@ -55,8 +55,6 @@ from transformers.trainer_callback import (
 from transformers.utils import is_peft_available
 from peft import PeftModel
 
-from examples.scripts.ppo.ppo_tldr import training_args
-
 from ..core import masked_mean, masked_whiten
 from ..models.utils import unwrap_model_for_generation
 from ..trainer.utils import (

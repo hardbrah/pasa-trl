@@ -93,7 +93,7 @@ if __name__ == "__main__":
     config = AutoConfig.from_pretrained(
         training_args.reward_model_path,
         num_labels=1,
-        trust_remote_code=model_args.trust_remote_code,
+        trust_remote_code=model_config.trust_remote_code,
     )
     value_model = CustomQwen2ForSequenceClassification(
         lora_path=training_args.lora_path, config=config
@@ -103,7 +103,7 @@ if __name__ == "__main__":
             nn.init.normal_(m.weight, mean=0, std=0.01)
     ref_policy = None
     policy_base = AutoModelForCausalLM.from_pretrained(
-        training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code
+        training_args.sft_model_path, trust_remote_code=model_config.trust_remote_code
     )
     policy = PeftModel.from_pretrained(
         policy_base,
