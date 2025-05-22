@@ -156,8 +156,6 @@ class PPOTrainer(Trainer):
         self.model_adapter_name = config.model_adapter_name
         self.ref_adapter_name = config.ref_adapter_name
         self.is_peft_model = is_peft_available() and isinstance(self.policy, PeftModel)
-        self.model_adapter_name = training_args.model_adapter_name
-        self.ref_adapter_name = training_args.ref_adapter_name
         #########
         # calculate various batch sizes
         #########
@@ -311,11 +309,16 @@ class PPOTrainer(Trainer):
                     args.fp16,
                     args.bf16,
                 )
-            self.ref_policy = prepare_deepspeed(
-                self.ref_policy, args.per_device_train_batch_size, args.fp16, args.bf16
-            )
+            if ref_policy is not None:
+                self.ref_policy = prepare_deepspeed(
+                    self.ref_policy,
+                    args.per_device_train_batch_size,
+                    args.fp16,
+                    args.bf16,
+                )
         else:
-            self.ref_policy = self.ref_policy.to(self.accelerator.device)
+            if self.ref_policy is not None:
+                self.ref_policy = self.ref_policy.to(self.accelerator.device)
             if reward_model is not None:
                 self.reward_model = self.reward_model.to(self.accelerator.device)
 
@@ -361,7 +364,7 @@ class PPOTrainer(Trainer):
         accelerator = self.accelerator
         optimizer = self.optimizer
         model = self.model
-        ref_policy = self.ref_policy.cpu()
+        ref_policy = self.ref_policy
         processing_class = self.processing_class
         dataloader = self.dataloader
         device = accelerator.device
@@ -604,7 +607,6 @@ class PPOTrainer(Trainer):
                     ).squeeze(
                         -1
                     )  # [batch_size, response_len]
-                    ref_policy = ref_policy.cpu()
                     del ref_output, ref_logits, ref_all_logprob
                     torch.cuda.empty_cache()
 
