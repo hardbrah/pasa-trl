@@ -11,7 +11,7 @@ from typing import List, Dict, Any
 
 from torch.nn.modules import padding
 from transformers.models.auto.tokenization_auto import AutoTokenizer
-from transformers.utils.dummy_pt_objects import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM
 from deepspeed.accelerator import get_accelerator
 from custom_agent.agent_dataset import prompts
 from custom_agent.search_tools import google_search_arxiv_id
@@ -136,45 +136,51 @@ def call_vm(value_model_prompts, tokenizer, device, value_model):
     return score
 
 
-# base_model = AutoModelForCausalLM.from_pretrained(
-#     "/root/autodl-tmp/models/Qwen/Qwen2___5-7B-Instruct",
-#     trust_remote_code=True,
-#     device_map="auto",
-#     torch_dtype=torch.bfloat16,
-# ).to("cuda")
-# tokenizer = AutoTokenizer.from_pretrained(
-#     "/root/autodl-tmp/models/Qwen/Qwen2___5-7B-Instruct",
-#     padding_side="left",
-#     trust_remote_code=True,
-# )
-# select_model = PeftModel.from_pretrained(base_model, "/root/pasa/results/sft_selector/checkpoint-4957").to("cuda")
+base_model = AutoModelForCausalLM.from_pretrained(
+    "/root/autodl-tmp/models/Qwen/Qwen2___5-7B-Instruct",
+    trust_remote_code=True,
+    torch_dtype=torch.bfloat16,
+).to("cuda")
+tokenizer = AutoTokenizer.from_pretrained(
+    "/root/autodl-tmp/models/Qwen/Qwen2___5-7B-Instruct",
+    padding_side="left",
+    trust_remote_code=True,
+)
+select_model = PeftModel.from_pretrained(
+    base_model,
+    model_id="/root/pasa/results/sft_selector/checkpoint-4957",
+    is_trainable=False,
+    torch_dtype=torch.bfloat16,
+    adapter_name="selector",
+).to("cuda")
 
 
 def call_selector(select_prompts: List[str]) -> List[Dict[str, Any]]:
     # warnings.warn(
     #     "Deploy an additional selector to get the relevant possibilities of paper and user_query.\nImplement a function `call_selector` that takes the prompts of the selector as input and returns the probability scores."
     # )
-    # if len(select_prompts) == 0:
-    #     return [{"prob": 0} for _ in range(len(select_prompts))]
-    # encoded_input = tokenizer(
-    #     select_prompts, return_tensors="pt", padding=True, truncation=True
-    # )
-    # input_ids = encoded_input.input_ids.cuda(select_model.device)
-    # attention_mask = encoded_input.attention_mask.cuda(select_model.device)
+    if len(select_prompts) == 0:
+        return [{"prob": 0} for _ in range(len(select_prompts))]
+    encoded_input = tokenizer(
+        select_prompts, return_tensors="pt", padding=True, truncation=True
+    )
+    input_ids = encoded_input.input_ids.to("cuda")
+    attention_mask = encoded_input.attention_mask.to("cuda")
 
-    # outputs = select_model.generate(
-    #     input_ids=input_ids,
-    #     attention_mask=attention_mask,
-    #     max_new_tokens=1,
-    #     output_scores=True,
-    #     return_dict_in_generate=True,
-    #     do_sample=False,
-    # )
-    # true_token_id = tokenizer.convert_tokens_to_ids("True")
-    # probs = outputs.scores[0].softmax(dim=-1)[:, true_token_id].cpu().numpy().tolist()
-    # return [{"prob": p} for p in probs]
+    outputs = select_model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=1,
+        output_scores=True,
+        return_dict_in_generate=True,
+        do_sample=False,
+    )
+    true_token_id = tokenizer.convert_tokens_to_ids("True")
+    probs = outputs.scores[0].softmax(dim=-1)[:, true_token_id].cpu().numpy().tolist()
+    del input_ids, attention_mask, outputs
+    return [{"prob": p} for p in probs]
 
-    return [{"prob": 0} for _ in range(len(select_prompts))]
+    # return [{"prob": 0} for _ in range(len(select_prompts))]
 
 
 def response_handler(
@@ -386,7 +392,7 @@ def rollout(
     for thread in threads:
         thread.join()
 
-    torch.distributed.barrier()
+    # torch.distributed.barrier()
     all_scores_list = []
     for i in range(query_responses.shape[0]):
         if i in all_scores:

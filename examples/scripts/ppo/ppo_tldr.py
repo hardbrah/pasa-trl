@@ -62,8 +62,10 @@ class CustomQwen2ForSequenceClassification(Qwen2ForSequenceClassification):
     def __init__(self, lora_path, config) -> None:
         super().__init__(config)
         self.num_labels = 1
-        model = Qwen2Model(config)
-        self.model = PeftModel.from_pretrained(model, lora_path, is_trainable=True)
+        # model = Qwen2Model(config).to(dtype=torch.bfloat16)
+        self.model = PeftModel.from_pretrained(
+            self.model, lora_path, is_trainable=True, torch_dtype=torch.bfloat16
+        )
         self.score = nn.Sequential(
             nn.Linear(config.hidden_size, 384, bias=False),
             nn.Linear(384, self.num_labels, bias=False),
@@ -82,7 +84,6 @@ if __name__ == "__main__":
         model_config.model_name_or_path,
         padding_side="left",
         trust_remote_code=model_config.trust_remote_code,
-        max_length=1024,
     )
     train_dataset = AgentDataset(script_args.dataset_name, tokenizer)
     assert (
@@ -103,21 +104,27 @@ if __name__ == "__main__":
             nn.init.normal_(m.weight, mean=0, std=0.01)
     ref_policy = None
     policy_base = AutoModelForCausalLM.from_pretrained(
-        training_args.sft_model_path, trust_remote_code=model_config.trust_remote_code
+        training_args.sft_model_path,
+        trust_remote_code=model_config.trust_remote_code,
+        torch_dtype=torch.bfloat16,
     )
     policy = PeftModel.from_pretrained(
         policy_base,
         adapter_name=training_args.model_adapter_name,
         torch_dtype=torch.bfloat16,
         model_id=training_args.lora_path,
-        lora_dropout=0.0,
         is_trainable=True,
     )
     policy.load_adapter(
         training_args.lora_path,
         adapter_name=training_args.ref_adapter_name,
         is_trainable=False,
+        torch_dtype=torch.bfloat16,
     )
+    policy = policy.to(dtype=torch.bfloat16)
+    value_model = value_model.to(dtype=torch.bfloat16)
+    if ref_policy is not None:
+        ref_policy = ref_policy.to(dtype=torch.bfloat16)
 
     trainer = FixZero3CheckpointPPOTrainer(
         config=training_args,

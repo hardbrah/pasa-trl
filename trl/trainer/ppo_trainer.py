@@ -513,7 +513,7 @@ class PPOTrainer(Trainer):
                             queries_list.append(queries)
                             context_length = queries.shape[1]
                             context_lengths.append(context_length)
-                        torch.distributed.barrier()
+                        # torch.distributed.barrier()
 
                 # pad each batch to the same length
                 context_length, max_response_len = max(context_lengths), max(
