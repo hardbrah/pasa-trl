@@ -31,6 +31,8 @@ from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 from custom_agent.agent_dataset import AgentDataset
 from typing import Optional
 import torch.nn as nn
+import torch
+from peft import PeftModel
 
 
 class FixZero3CheckpointPPOTrainer(PPOTrainer):
@@ -64,7 +66,7 @@ class CustomQwen2ForSequenceClassification(Qwen2ForSequenceClassification):
         self.model = PeftModel.from_pretrained(model, lora_path, is_trainable=True)
         self.score = nn.Sequential(
             nn.Linear(config.hidden_size, 384, bias=False),
-            nn.Linear(384, num_labels, bias=False),
+            nn.Linear(384, self.num_labels, bias=False),
         )
 
         self.post_init()
@@ -80,6 +82,7 @@ if __name__ == "__main__":
         model_config.model_name_or_path,
         padding_side="left",
         trust_remote_code=model_config.trust_remote_code,
+        max_length=1024,
     )
     train_dataset = AgentDataset(script_args.dataset_name, tokenizer)
     assert (

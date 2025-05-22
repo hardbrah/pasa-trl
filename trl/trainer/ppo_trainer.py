@@ -55,6 +55,8 @@ from transformers.trainer_callback import (
 from transformers.utils import is_peft_available
 from peft import PeftModel
 
+from examples.scripts.ppo.ppo_tldr import training_args
+
 from ..core import masked_mean, masked_whiten
 from ..models.utils import unwrap_model_for_generation
 from ..trainer.utils import (
@@ -153,9 +155,9 @@ class PPOTrainer(Trainer):
         self.paper_id = json.load(open(paper_id, "r"))
         self.model_adapter_name = config.model_adapter_name
         self.ref_adapter_name = config.ref_adapter_name
-        self.is_peft_model = is_peft_available() and isinstance(
-            self.policy_model, PeftModel
-        )
+        self.is_peft_model = is_peft_available() and isinstance(self.policy, PeftModel)
+        self.model_adapter_name = training_args.model_adapter_name
+        self.ref_adapter_name = training_args.ref_adapter_name
         #########
         # calculate various batch sizes
         #########
@@ -214,11 +216,10 @@ class PPOTrainer(Trainer):
         #########
         # setup model, optimizer, and others
         #########
-        for module in [policy, ref_policy, value_model]:
+        for module in [policy, ref_policy, value_model, reward_model]:
             # for module in [policy, value_model]:
-            disable_dropout_in_model(module)
-        if reward_model is not None:
-            disable_dropout_in_model(reward_model)
+            if module is not None:
+                disable_dropout_in_model(module)
         if args.stop_token and args.stop_token == "eos":
             args.stop_token_id = processing_class.eos_token_id
         self.model = PolicyAndValueWrapper(policy, value_model)
